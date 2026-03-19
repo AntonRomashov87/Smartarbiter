@@ -1,6 +1,6 @@
 """
-Telegram Bot для Smart Арбітра — надсилає жеребкування учасникам
-Адаптовано з chess-results бота для роботи з Firebase
+Smart Арбітр Bot v2 — Множинні турніри
+Підтримка моніторингу кількох турнірів одночасно
 """
 
 import os
@@ -22,7 +22,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv не встановлено — працюємо зі змінними оточення
+    pass
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ЛОГУВАННЯ
@@ -37,12 +37,10 @@ log = logging.getLogger(__name__)
 
 TOKEN = os.environ.get('TELEGRAM_TOKEN', 'ТВІЙ_ТОКЕН')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', '0'))
-CHECK_INTERVAL = 60  # кожну хвилину (швидше ніж chess-results)
+CHECK_INTERVAL = 60
 DATA_FILE = 'data.json'
 
-# Firebase
 FIREBASE_DATABASE_URL = os.getenv('FIREBASE_DATABASE_URL', 'https://your-project.firebaseio.com')
-TOURNAMENT_ID = os.getenv('TOURNAMENT_ID', 'your-tournament-id')
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
@@ -52,7 +50,6 @@ app = Flask(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def init_firebase():
-    """Ініціалізує Firebase Admin SDK"""
     try:
         service_account_json = os.getenv('FIREBASE_SERVICE_ACCOUNT')
         if service_account_json:
@@ -70,7 +67,7 @@ def init_firebase():
         raise
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ДАНІ
+# ДАНІ (нова структура для множинних турнірів)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def load_data():
@@ -78,10 +75,9 @@ def load_data():
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {
-        "tournament_id": TOURNAMENT_ID,  # ID турніру
-        "last_round": 0,                  # останній оброблений тур
-        "students": {},                   # {ім'я: {chat_id, phone}}
-        "pending": {}                     # тимчасові реєстрації
+        "tournaments": {},  # {tournament_id: {name, last_round, students: [names]}}
+        "students": {},     # {name: {chat_id, registered}}
+        "pending": {}
     }
 
 def save_data(data):
@@ -98,9 +94,9 @@ def keyboard_teacher():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
         types.KeyboardButton("📋 Список учнів"),
-        types.KeyboardButton("🔍 Перевірити жеребкування"),
+        types.KeyboardButton("🎯 Турніри"),
         types.KeyboardButton("➕ Додати учня"),
-        types.KeyboardButton("🔗 Встановити турнір"),
+        types.KeyboardButton("➕ Додати турнір"),
         types.KeyboardButton("⚠️ Незареєстровані"),
         types.KeyboardButton("ℹ️ Допомога"),
     )
@@ -109,7 +105,7 @@ def keyboard_teacher():
 def keyboard_student():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
-        types.KeyboardButton("♟️ Моє жеребкування"),
+        types.KeyboardButton("♟️ Мої турніри"),
         types.KeyboardButton("ℹ️ Допомога"),
     )
     return kb
@@ -122,26 +118,22 @@ def keyboard_cancel():
 user_states = {}
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ПАРСИНГ FIREBASE (Smart Арбітр)
+# FIREBASE (Smart Арбітр)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fetch_tournament_data(tournament_id):
-    """Завантажує дані турніру з Firebase"""
     try:
         ref = firebase_db.reference(f'/tournaments/{tournament_id}')
         data = ref.get()
-        
         if not data:
             log.warning(f"❌ Турнір {tournament_id} не знайдено")
             return None
-        
         return data
     except Exception as e:
         log.error(f"❌ Помилка Firebase: {e}")
         return None
 
 def parse_players(data):
-    """Парсить гравців з Firebase"""
     players_json = data.get('players')
     if not players_json:
         return {}
@@ -157,8 +149,7 @@ def parse_players(data):
             if player_id and name:
                 player_map[player_id] = {
                     'name': name,
-                    'elo': player.get('elo', 0),
-                    'phone': player.get('phone') or player.get('phoneNumber')
+                    'elo': player.get('elo', 0)
                 }
         
         return player_map
@@ -167,28 +158,23 @@ def parse_players(data):
         return {}
 
 def parse_rounds(data):
-    """Парсить тури з Firebase"""
     rounds_json = data.get('rounds')
     if not rounds_json:
         return []
     
     try:
-        rounds = json.loads(rounds_json)
-        return rounds
+        return json.loads(rounds_json)
     except Exception as e:
         log.error(f"❌ Помилка парсингу турів: {e}")
         return []
 
 def normalize(text):
-    """Нормалізує ім'я для порівняння"""
     return text.lower().replace(',', '').replace('  ', ' ').strip()
 
 def find_player_pairing(pairs, player_name, player_map):
-    """Знаходить пару для гравця"""
     name_norm = normalize(player_name)
     
     for pair in pairs:
-        # БАЙ
         if pair.get('isBye'):
             white_id = pair.get('white', {}).get('id')
             if white_id in player_map:
@@ -200,7 +186,6 @@ def find_player_pairing(pairs, player_name, player_map):
                     }
             continue
         
-        # Звичайна пара
         white_id = pair.get('white', {}).get('id')
         black_id = pair.get('black', {}).get('id')
         
@@ -213,7 +198,6 @@ def find_player_pairing(pairs, player_name, player_map):
         white_name = white_player['name']
         black_name = black_player['name']
         
-        # Перевіряємо чи це наш гравець
         if name_norm in normalize(white_name):
             return {
                 'is_bye': False,
@@ -238,18 +222,19 @@ def find_player_pairing(pairs, player_name, player_map):
     
     return None
 
-def format_pairing_message(pairing, round_num):
-    """Форматує повідомлення про пару"""
+def format_pairing_message(pairing, round_num, tournament_name):
     if pairing['is_bye']:
         return (
-            f"🔔 <b>Тур №{round_num}</b>\n\n"
+            f"🔔 <b>{tournament_name}</b>\n"
+            f"<b>Тур №{round_num}</b>\n\n"
             f"♟️ <b>{pairing['player_name']}</b>\n\n"
             f"🏖️ У вас <b>БАЙ</b> (+1 очко)\n\n"
             f"Відпочиньте та підготуйтесь до наступного туру!"
         )
     else:
         return (
-            f"🔔 <b>Тур №{round_num}</b>\n\n"
+            f"🔔 <b>{tournament_name}</b>\n"
+            f"<b>Тур №{round_num}</b>\n\n"
             f"♟️ <b>{pairing['player_name']}</b>\n"
             f"🪑 Дошка №<b>{pairing['board']}</b>\n\n"
             f"▶️ Граєш <b>{pairing['color_text']}</b>\n"
@@ -259,114 +244,122 @@ def format_pairing_message(pairing, round_num):
         )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# АВТОПЕРЕВІРКА
+# АВТОПЕРЕВІРКА (для всіх турнірів)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def auto_check_loop():
-    """Моніторить турнір та надсилає сповіщення"""
     log.info(f"🔄 Автоперевірка кожні {CHECK_INTERVAL} сек")
     
     while True:
         time.sleep(CHECK_INTERVAL)
         
         try:
-            tournament_id = db_local.get('tournament_id', TOURNAMENT_ID)
-            students = db_local.get('students', {})
+            tournaments = db_local.get('tournaments', {})
             
-            if not students:
-                log.debug("Немає учнів для моніторингу")
+            if not tournaments:
+                log.debug("Немає активних турнірів для моніторингу")
                 continue
             
-            # Завантажуємо дані турніру
-            data = fetch_tournament_data(tournament_id)
-            if not data:
-                continue
-            
-            # Парсимо гравців та тури
-            player_map = parse_players(data)
-            rounds = parse_rounds(data)
-            
-            if not rounds:
-                log.debug("Тури ще не створені")
-                continue
-            
-            current_round_count = len(rounds)
-            last_round = db_local.get('last_round', 0)
-            
-            # Перевіряємо чи з'явився новий тур
-            if current_round_count <= last_round:
-                continue
-            
-            log.info(f"🆕 НОВИЙ тур {current_round_count}! Надсилаю сповіщення...")
-            
-            # Беремо останній тур
-            latest_round = rounds[-1]
-            pairs = latest_round.get('pairs', [])
-            
-            not_registered = []
-            sent_count = 0
-            error_count = 0
-            
-            # Надсилаємо кожному учню
-            for student_name, info in students.items():
-                chat_id = info.get('chat_id')
-                
-                if not chat_id:
-                    not_registered.append(student_name)
-                    continue
-                
-                # Шукаємо пару для цього учня
-                pairing = find_player_pairing(pairs, student_name, player_map)
-                
-                if pairing:
-                    try:
-                        message = format_pairing_message(pairing, current_round_count)
-                        bot.send_message(
-                            chat_id,
-                            message,
-                            parse_mode='HTML',
-                            reply_markup=keyboard_student()
-                        )
-                        log.info(f"✅ Надіслано: {student_name}")
-                        sent_count += 1
-                    except Exception as e:
-                        log.error(f"❌ Помилка для {student_name}: {e}")
-                        error_count += 1
-                else:
-                    # Гравця не знайдено в жеребкуванні
-                    try:
-                        bot.send_message(
-                            chat_id,
-                            f"⚠️ Тур {current_round_count} розпочато, але <b>{student_name}</b> "
-                            f"не знайдено в жеrebкуванні.\nМожливо, пропуск туру.",
-                            parse_mode='HTML',
-                            reply_markup=keyboard_student()
-                        )
-                    except:
-                        pass
-            
-            log.info(f"📊 Відправлено: {sent_count}, помилок: {error_count}")
-            
-            # Сповіщаємо адміна про незареєстрованих
-            if not_registered and ADMIN_ID:
-                names = "\n".join(f"• {n}" for n in not_registered)
-                bot.send_message(
-                    ADMIN_ID,
-                    f"🆕 <b>Тур {current_round_count} розпочано!</b>\n\n"
-                    f"Ці учні не отримали сповіщення (не писали /start):\n{names}",
-                    parse_mode='HTML',
-                    reply_markup=keyboard_teacher()
-                )
-            
-            # Оновлюємо останній тур
-            db_local['last_round'] = current_round_count
-            save_data(db_local)
-            
+            for tournament_id, tournament_info in tournaments.items():
+                check_tournament(tournament_id, tournament_info)
+                    
         except Exception as e:
             log.error(f"❌ Помилка в auto_check_loop: {e}", exc_info=True)
 
+def check_tournament(tournament_id, tournament_info):
+    """Перевіряє один турнір на нові тури"""
+    try:
+        tournament_name = tournament_info.get('name', tournament_id)
+        tournament_students = tournament_info.get('students', [])
+        last_round = tournament_info.get('last_round', 0)
+        
+        if not tournament_students:
+            return
+        
+        data = fetch_tournament_data(tournament_id)
+        if not data:
+            return
+        
+        player_map = parse_players(data)
+        rounds = parse_rounds(data)
+        
+        if not rounds:
+            return
+        
+        current_round_count = len(rounds)
+        
+        if current_round_count <= last_round:
+            return
+        
+        log.info(f"🆕 НОВИЙ тур {current_round_count} в турнірі '{tournament_name}'!")
+        
+        latest_round = rounds[-1]
+        pairs = latest_round.get('pairs', [])
+        
+        not_registered = []
+        sent_count = 0
+        error_count = 0
+        
+        all_students = db_local.get('students', {})
+        
+        for student_name in tournament_students:
+            if student_name not in all_students:
+                continue
+            
+            student_info = all_students[student_name]
+            chat_id = student_info.get('chat_id')
+            
+            if not chat_id:
+                not_registered.append(student_name)
+                continue
+            
+            pairing = find_player_pairing(pairs, student_name, player_map)
+            
+            if pairing:
+                try:
+                    message = format_pairing_message(pairing, current_round_count, tournament_name)
+                    bot.send_message(
+                        chat_id,
+                        message,
+                        parse_mode='HTML',
+                        reply_markup=keyboard_student()
+                    )
+                    log.info(f"✅ Надіслано: {student_name} ({tournament_name})")
+                    sent_count += 1
+                except Exception as e:
+                    log.error(f"❌ Помилка для {student_name}: {e}")
+                    error_count += 1
+            else:
+                try:
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ <b>{tournament_name}</b>\nТур {current_round_count} розпочато, але <b>{student_name}</b> "
+                        f"не знайдено в жеребкуванні.\nМожливо, пропуск туру.",
+                        parse_mode='HTML',
+                        reply_markup=keyboard_student()
+                    )
+                except:
+                    pass
+        
+        log.info(f"📊 [{tournament_name}] Відправлено: {sent_count}, помилок: {error_count}")
+        
+        if not_registered and ADMIN_ID:
+            names = "\n".join(f"• {n}" for n in not_registered)
+            bot.send_message(
+                ADMIN_ID,
+                f"🆕 <b>{tournament_name}</b>\n<b>Тур {current_round_count} розпочано!</b>\n\n"
+                f"Ці учні не отримали сповіщення:\n{names}",
+                parse_mode='HTML',
+                reply_markup=keyboard_teacher()
+            )
+        
+        db_local['tournaments'][tournament_id]['last_round'] = current_round_count
+        save_data(db_local)
+        
+    except Exception as e:
+        log.error(f"❌ Помилка check_tournament для {tournament_id}: {e}", exc_info=True)
+
 def self_ping_loop():
-    """Самопінг для Render"""
     time.sleep(60)
     app_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not app_url:
@@ -398,7 +391,7 @@ def get_student_name(user_id):
     return None
 
 # ═══════════════════════════════════════════════════════════════════════════
-# КОМАНДИ БОТА
+# КОМАНДИ
 # ═══════════════════════════════════════════════════════════════════════════
 
 @bot.message_handler(commands=['start'])
@@ -409,17 +402,18 @@ def cmd_start(message):
     full_name = f"{last_name} {first_name}".strip()
 
     if user_id == ADMIN_ID:
+        tournaments_count = len(db_local.get('tournaments', {}))
         bot.send_message(
             user_id,
             f"👋 Привіт, Антоне Володимировичу!\n\n"
-            f"Твій ID: <code>{user_id}</code>\n\n"
+            f"Твій ID: <code>{user_id}</code>\n"
+            f"Активних турнірів: {tournaments_count}\n\n"
             f"Використовуй кнопки нижче 👇",
             parse_mode='HTML',
             reply_markup=keyboard_teacher()
         )
         return
 
-    # Шукаємо учня за ім'ям в Telegram
     matched = None
     full_name_norm = normalize(full_name)
     for student_name in db_local.get('students', {}):
@@ -468,18 +462,18 @@ def cmd_start(message):
 def cmd_help(message):
     if is_admin(message):
         text = (
-            "⚙️ <b>Керування ботом:</b>\n\n"
+            "⚙️ <b>Керування ботом v2:</b>\n\n"
             "📋 <b>Список учнів</b> — хто зареєстрований\n"
-            "🔍 <b>Перевірити жеребкування</b> — показати поточний тур\n"
-            "➕ <b>Додати учня</b> — додати до відстеження\n"
-            "🔗 <b>Встановити турнір</b> — ID турніру з Firebase\n"
+            "🎯 <b>Турніри</b> — список активних турнірів\n"
+            "➕ <b>Додати учня</b> — додати до списку\n"
+            "➕ <b>Додати турнір</b> — почати моніторити новий турнір\n"
             "⚠️ <b>Незареєстровані</b> — хто не писав /start\n\n"
-            "🤖 Бот автоматично знаходить нові тури і надсилає сповіщення!"
+            "🤖 Бот автоматично моніторить ВСІ активні турніри!"
         )
     else:
         text = (
             "♟️ <b>Smart Арбітр Bot</b>\n\n"
-            "♟️ <b>Моє жеребкування</b> — перевірити з ким граю\n\n"
+            "♟️ <b>Мої турніри</b> — переглянути в яких турнірах граю\n\n"
             "Бот автоматично надішле сповіщення щойно з'явиться новий тур!"
         )
     bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=get_keyboard(message))
@@ -511,58 +505,34 @@ def btn_list(message):
         reply_markup=keyboard_teacher()
     )
 
-@bot.message_handler(func=lambda m: m.text == "🔍 Перевірити жеребкування")
-def btn_check_all(message):
+@bot.message_handler(func=lambda m: m.text == "🎯 Турніри")
+def btn_tournaments(message):
     if not is_admin(message):
         return
     
-    tournament_id = db_local.get('tournament_id', TOURNAMENT_ID)
-    bot.send_chat_action(message.chat.id, 'typing')
-    bot.send_message(message.chat.id, "🔍 Завантажую дані турніру...", reply_markup=keyboard_teacher())
+    tournaments = db_local.get('tournaments', {})
     
-    data = fetch_tournament_data(tournament_id)
-    if not data:
+    if not tournaments:
         bot.send_message(
             message.chat.id,
-            f"❌ Турнір {tournament_id} не знайдено",
+            "Немає активних турнірів.\nНатисни ➕ Додати турнір",
             reply_markup=keyboard_teacher()
         )
         return
     
-    player_map = parse_players(data)
-    rounds = parse_rounds(data)
-    
-    if not rounds:
-        bot.send_message(
-            message.chat.id,
-            "🕐 Жеребкування ще не створено",
-            reply_markup=keyboard_teacher()
-        )
-        return
-    
-    round_num = len(rounds)
-    latest_round = rounds[-1]
-    pairs = latest_round.get('pairs', [])
+    lines = []
+    for tid, info in tournaments.items():
+        name = info.get('name', tid)
+        students_count = len(info.get('students', []))
+        last_round = info.get('last_round', 0)
+        lines.append(f"🎯 <b>{name}</b>\n   Учнів: {students_count} | Останній тур: {last_round}\n   ID: <code>{tid}</code>")
     
     bot.send_message(
         message.chat.id,
-        f"📅 <b>Тур №{round_num}</b>",
+        f"🎯 <b>Активні турніри ({len(tournaments)}):</b>\n\n" + "\n\n".join(lines),
         parse_mode='HTML',
         reply_markup=keyboard_teacher()
     )
-    
-    students = db_local.get('students', {})
-    for student_name in students:
-        pairing = find_player_pairing(pairs, student_name, player_map)
-        if pairing:
-            message_text = format_pairing_message(pairing, round_num)
-            bot.send_message(message.chat.id, message_text, parse_mode='HTML')
-        else:
-            bot.send_message(
-                message.chat.id,
-                f"🤷 <b>{student_name}</b> — не знайдено в турі {round_num}",
-                parse_mode='HTML'
-            )
 
 @bot.message_handler(func=lambda m: m.text == "➕ Додати учня")
 def btn_add_student(message):
@@ -577,22 +547,21 @@ def btn_add_student(message):
         reply_markup=keyboard_cancel()
     )
 
-@bot.message_handler(func=lambda m: m.text == "🔗 Встановити турнір")
-def btn_set_tournament(message):
+@bot.message_handler(func=lambda m: m.text == "➕ Додати турнір")
+def btn_add_tournament(message):
     if not is_admin(message):
         return
     
-    current = db_local.get('tournament_id', '')
-    current_text = f"\n\nПоточний турнір:\n<code>{current}</code>" if current else ""
-    
-    user_states[message.from_user.id] = 'waiting_tournament_id'
+    user_states[message.from_user.id] = 'waiting_tournament_data'
     bot.send_message(
         message.chat.id,
-        f"Надішли ID турніру з Firebase{current_text}\n\n"
-        f"Знайти ID можна:\n"
-        f"• В URL Smart Арбітра після #\n"
-        f"• В Firebase Console → tournaments → ID\n\n"
-        f"Наприклад: <code>tournament_2025_03_18_123</code>",
+        "📝 Додавання турніру\n\n"
+        "Надішли дані у форматі:\n"
+        "<code>ID | Назва | Учні</code>\n\n"
+        "Приклад:\n"
+        "<code>trenuvalxnyy_turni_586285 | Тренувальний | Іваненко Іван, Петренко Петро, Сидоренко Сергій</code>\n\n"
+        "Або тільки ID (учні будуть всі зареєстровані):\n"
+        "<code>trenuvalxnyy_turni_586285</code>",
         parse_mode='HTML',
         reply_markup=keyboard_cancel()
     )
@@ -621,8 +590,8 @@ def btn_not_registered(message):
             reply_markup=keyboard_teacher()
         )
 
-@bot.message_handler(func=lambda m: m.text == "♟️ Моє жеребкування")
-def btn_my_pairing(message):
+@bot.message_handler(func=lambda m: m.text == "♟️ Мої турніри")
+def btn_my_tournaments(message):
     user_id = message.from_user.id
     
     student_name = get_student_name(user_id)
@@ -634,48 +603,23 @@ def btn_my_pairing(message):
         )
         return
     
-    tournament_id = db_local.get('tournament_id', TOURNAMENT_ID)
-    bot.send_chat_action(message.chat.id, 'typing')
+    tournaments = db_local.get('tournaments', {})
+    my_tournaments = []
     
-    data = fetch_tournament_data(tournament_id)
-    if not data:
+    for tid, info in tournaments.items():
+        if student_name in info.get('students', []):
+            my_tournaments.append(f"🎯 {info.get('name', tid)} (Тур {info.get('last_round', 0)})")
+    
+    if not my_tournaments:
         bot.send_message(
             message.chat.id,
-            "❌ Не можу завантажити дані турніру",
-            reply_markup=keyboard_student()
-        )
-        return
-    
-    player_map = parse_players(data)
-    rounds = parse_rounds(data)
-    
-    if not rounds:
-        bot.send_message(
-            message.chat.id,
-            "🕐 Жеребкування ще не створено",
-            reply_markup=keyboard_student()
-        )
-        return
-    
-    round_num = len(rounds)
-    latest_round = rounds[-1]
-    pairs = latest_round.get('pairs', [])
-    
-    pairing = find_player_pairing(pairs, student_name, player_map)
-    
-    if pairing:
-        message_text = format_pairing_message(pairing, round_num)
-        bot.send_message(
-            message.chat.id,
-            message_text,
-            parse_mode='HTML',
+            "У тебе поки немає активних турнірів.",
             reply_markup=keyboard_student()
         )
     else:
         bot.send_message(
             message.chat.id,
-            f"🤷 <b>{student_name}</b>, тебе не знайдено в турі {round_num}.\n"
-            f"Можливо, пропуск туру.",
+            f"♟️ <b>Твої турніри:</b>\n\n" + "\n".join(my_tournaments),
             parse_mode='HTML',
             reply_markup=keyboard_student()
         )
@@ -690,17 +634,44 @@ def handle_text(message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # Адмін вводить ID турніру
-    if user_states.get(user_id) == 'waiting_tournament_id':
-        db_local['tournament_id'] = text
-        db_local['last_round'] = 0  # скидаємо
+    # Адмін додає турнір
+    if user_states.get(user_id) == 'waiting_tournament_data':
+        parts = [p.strip() for p in text.split('|')]
+        
+        if len(parts) == 1:
+            # Тільки ID — всі учні
+            tournament_id = parts[0]
+            tournament_name = tournament_id
+            all_students = list(db_local.get('students', {}).keys())
+            tournament_students = all_students
+        elif len(parts) >= 3:
+            # ID | Назва | Учні
+            tournament_id = parts[0]
+            tournament_name = parts[1]
+            tournament_students = [s.strip() for s in parts[2].split(',')]
+        else:
+            bot.send_message(
+                message.chat.id,
+                "❌ Невірний формат. Спробуй ще раз.",
+                reply_markup=keyboard_cancel()
+            )
+            return
+        
+        db_local.setdefault('tournaments', {})[tournament_id] = {
+            'name': tournament_name,
+            'last_round': 0,
+            'students': tournament_students
+        }
         save_data(db_local)
         user_states.pop(user_id)
         
         bot.send_message(
             message.chat.id,
-            f"✅ Турнір встановлено!\n\nID: <code>{text}</code>\n\n"
-            f"Бот автоматично шукатиме нові тури 🤖",
+            f"✅ <b>Турнір додано!</b>\n\n"
+            f"Назва: {tournament_name}\n"
+            f"ID: <code>{tournament_id}</code>\n"
+            f"Учнів: {len(tournament_students)}\n\n"
+            f"Бот почав моніторинг! 🤖",
             parse_mode='HTML',
             reply_markup=keyboard_teacher()
         )
@@ -766,9 +737,8 @@ def handle_text(message):
 def home():
     s = db_local.get('students', {})
     reg = sum(1 for i in s.values() if i.get('chat_id'))
-    rd = db_local.get('last_round', 0)
-    tid = db_local.get('tournament_id', '—')
-    return f"♟️ Smart Арбітр Bot | Учнів: {len(s)} | Зареєстровано: {reg} | Останній тур: {rd} | Турнір: {tid}"
+    t = db_local.get('tournaments', {})
+    return f"♟️ Smart Арбітр Bot v2 | Учнів: {len(s)} | Зареєстровано: {reg} | Турнірів: {len(t)}"
 
 def run_web():
     port = int(os.environ.get('PORT', 5000))
@@ -779,15 +749,12 @@ def run_web():
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"♟️ Smart Арбітр Bot | Admin: {ADMIN_ID} | Інтервал: {CHECK_INTERVAL}s")
+    print(f"♟️ Smart Арбітр Bot v2 | Admin: {ADMIN_ID} | Інтервал: {CHECK_INTERVAL}s")
     
-    # Ініціалізуємо Firebase
     init_firebase()
     
-    # Запускаємо фонові потоки
     Thread(target=run_web, daemon=True).start()
     Thread(target=auto_check_loop, daemon=True).start()
     Thread(target=self_ping_loop, daemon=True).start()
     
-    # Запускаємо бота
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
