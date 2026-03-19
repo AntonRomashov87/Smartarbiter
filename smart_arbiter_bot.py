@@ -46,6 +46,16 @@ FIREBASE_DATABASE_URL = os.getenv('FIREBASE_DATABASE_URL', 'https://your-project
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
+@app.after_request
+def add_cors_headers(response):
+    # Дозволяємо запити з будь-якого домену (потрібно для Smart Арбітра)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FIREBASE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -254,9 +264,11 @@ def home():
     return (f"♟️ Smart Арбітр Bot v2 | Учнів: {len(s)} | Зареєстровано: {reg} | "
             f"Турнірів: {len(t)} | TG users: {tg_known}")
 
-@app.route('/ping')
+@app.route('/ping', methods=['GET', 'OPTIONS'])
 def ping():
     """Перевірка з'єднання з Smart Арбітра"""
+    if request.method == 'OPTIONS':
+        return '', 204
     return jsonify({
         'status': 'ok',
         'bot': 'Smart Арбітр Bot v2',
@@ -264,7 +276,7 @@ def ping():
         'students': len(db_local.get('students', {}))
     })
 
-@app.route('/send-round', methods=['POST'])
+@app.route('/send-round', methods=['POST', 'OPTIONS'])
 def send_round():
     """
     Приймає жеребкування від Smart Арбітра і розсилає особисті повідомлення.
@@ -286,6 +298,10 @@ def send_round():
       ]
     }
     """
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        return '', 204
+
     try:
         data = request.get_json(force=True)
     except Exception:
