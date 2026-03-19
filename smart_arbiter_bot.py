@@ -21,7 +21,6 @@ from firebase_admin import credentials, db as firebase_db
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    log.info("✅ .env файл завантажено")
 except ImportError:
     pass  # dotenv не встановлено — працюємо зі змінними оточення
 
