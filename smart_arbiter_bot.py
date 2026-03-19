@@ -95,6 +95,7 @@ def keyboard_teacher():
     kb.add(
         types.KeyboardButton("📋 Список учнів"),
         types.KeyboardButton("🎯 Турніри"),
+        types.KeyboardButton("🔍 Перевірити жеребкування"),
         types.KeyboardButton("➕ Додати учня"),
         types.KeyboardButton("➕ Додати турнір"),
         types.KeyboardButton("⚠️ Незареєстровані"),
@@ -106,6 +107,7 @@ def keyboard_student():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
         types.KeyboardButton("♟️ Мої турніри"),
+        types.KeyboardButton("♟️ Моє жеребкування"),
         types.KeyboardButton("ℹ️ Допомога"),
     )
     return kb
@@ -534,6 +536,75 @@ def btn_tournaments(message):
         reply_markup=keyboard_teacher()
     )
 
+@bot.message_handler(func=lambda m: m.text == "🔍 Перевірити жеребкування")
+def btn_check_pairings(message):
+    if not is_admin(message):
+        return
+    
+    tournaments = db_local.get('tournaments', {})
+    
+    if not tournaments:
+        bot.send_message(
+            message.chat.id,
+            "Немає активних турнірів.",
+            reply_markup=keyboard_teacher()
+        )
+        return
+    
+    bot.send_chat_action(message.chat.id, 'typing')
+    bot.send_message(message.chat.id, "🔍 Завантажую дані турнірів...", reply_markup=keyboard_teacher())
+    
+    for tournament_id, tournament_info in tournaments.items():
+        tournament_name = tournament_info.get('name', tournament_id)
+        tournament_students = tournament_info.get('students', [])
+        
+        data = fetch_tournament_data(tournament_id)
+        if not data:
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>{tournament_name}</b>\nНе можу завантажити дані",
+                parse_mode='HTML'
+            )
+            continue
+        
+        player_map = parse_players(data)
+        rounds = parse_rounds(data)
+        
+        if not rounds:
+            bot.send_message(
+                message.chat.id,
+                f"🕐 <b>{tournament_name}</b>\nЖеребкування ще не створено",
+                parse_mode='HTML'
+            )
+            continue
+        
+        round_num = len(rounds)
+        latest_round = rounds[-1]
+        pairs = latest_round.get('pairs', [])
+        
+        bot.send_message(
+            message.chat.id,
+            f"📅 <b>{tournament_name}</b>\n<b>Тур №{round_num}</b>",
+            parse_mode='HTML'
+        )
+        
+        all_students = db_local.get('students', {})
+        
+        for student_name in tournament_students:
+            if student_name not in all_students:
+                continue
+            
+            pairing = find_player_pairing(pairs, student_name, player_map)
+            if pairing:
+                message_text = format_pairing_message(pairing, round_num, tournament_name)
+                bot.send_message(message.chat.id, message_text, parse_mode='HTML')
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    f"🤷 <b>{student_name}</b> — не знайдено в турі {round_num}",
+                    parse_mode='HTML'
+                )
+
 @bot.message_handler(func=lambda m: m.text == "➕ Додати учня")
 def btn_add_student(message):
     if not is_admin(message):
@@ -621,6 +692,75 @@ def btn_my_tournaments(message):
             message.chat.id,
             f"♟️ <b>Твої турніри:</b>\n\n" + "\n".join(my_tournaments),
             parse_mode='HTML',
+            reply_markup=keyboard_student()
+        )
+
+@bot.message_handler(func=lambda m: m.text == "♟️ Моє жеребкування")
+def btn_my_pairings(message):
+    user_id = message.from_user.id
+    
+    student_name = get_student_name(user_id)
+    if not student_name:
+        bot.send_message(
+            message.chat.id,
+            "❌ Тебе немає в списку. Зверніться до тренера.",
+            reply_markup=keyboard_student()
+        )
+        return
+    
+    tournaments = db_local.get('tournaments', {})
+    found_any = False
+    
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    for tournament_id, tournament_info in tournaments.items():
+        if student_name not in tournament_info.get('students', []):
+            continue
+        
+        tournament_name = tournament_info.get('name', tournament_id)
+        
+        data = fetch_tournament_data(tournament_id)
+        if not data:
+            continue
+        
+        player_map = parse_players(data)
+        rounds = parse_rounds(data)
+        
+        if not rounds:
+            bot.send_message(
+                message.chat.id,
+                f"🕐 <b>{tournament_name}</b>\nЖеребкування ще не створено",
+                parse_mode='HTML'
+            )
+            continue
+        
+        round_num = len(rounds)
+        latest_round = rounds[-1]
+        pairs = latest_round.get('pairs', [])
+        
+        pairing = find_player_pairing(pairs, student_name, player_map)
+        
+        if pairing:
+            found_any = True
+            message_text = format_pairing_message(pairing, round_num, tournament_name)
+            bot.send_message(
+                message.chat.id,
+                message_text,
+                parse_mode='HTML',
+                reply_markup=keyboard_student()
+            )
+        else:
+            bot.send_message(
+                message.chat.id,
+                f"🤷 <b>{tournament_name}</b>\nТебе не знайдено в турі {round_num}.\nМожливо, пропуск туру.",
+                parse_mode='HTML',
+                reply_markup=keyboard_student()
+            )
+    
+    if not found_any:
+        bot.send_message(
+            message.chat.id,
+            "У тебе поки немає активних турнірів з жеребкуванням.",
             reply_markup=keyboard_student()
         )
 
